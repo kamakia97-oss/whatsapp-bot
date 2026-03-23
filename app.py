@@ -7,16 +7,16 @@ from flask import Flask, request, jsonify
 from anthropic import Anthropic
 
 app = Flask(__name__)
-claude = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-WHAPI_TOKEN  = os.environ.get("WHAPI_TOKEN")
-WHAPI_URL    = "https://gate.whapi.cloud/messages/text"
-WHAPI_BASE   = "https://gate.whapi.cloud"
+claude       = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+INSTANCE_ID  = os.environ.get("ULTRAMSG_INSTANCE_ID")
+ULTRA_TOKEN  = os.environ.get("ULTRAMSG_TOKEN")
+ULTRA_URL    = f"https://api.ultramsg.com/{INSTANCE_ID}"
 OWNER_NUMBER = os.environ.get("OWNER_NUMBER")
-RENDER_URL   = os.environ.get("RENDER_URL", "https://whatsapp-bot-0xk2.onrender.com")
+RENDER_URL   = os.environ.get("RENDER_URL", "https://whatsapp-bot-1-ld65.onrender.com")
 
 conversations = {}
 active_chats  = set()
-processed_ids = set()  # Track processed message IDs to avoid duplicates
+processed_ids = set()
 
 SYSTEM_PROMPT = """You are acting AS the owner of this WhatsApp number.
 Reply to their friends naturally, as if you ARE that person.
@@ -26,28 +26,20 @@ Match their TONE and ENERGY.
 Keep replies SHORT like real WhatsApp messages.
 Sound like a real human friend ALWAYS."""
 
-# ── WHAPI HEADERS ─────────────────────────────────────────────
-def get_headers():
-    return {
-        "Authorization": f"Bearer {WHAPI_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
 # ── SEND MESSAGE ──────────────────────────────────────────────
 def send_message(phone, message):
-    phone = phone.replace("@s.whatsapp.net", "").replace("@c.us", "")
-    payload = {
-        "to": f"{phone}@s.whatsapp.net",
-        "body": message
-    }
+    phone = phone.replace("@c.us", "").replace("+", "")
     try:
         resp = requests.post(
-            f"{WHAPI_BASE}/messages/text",
-            json=payload,
-            headers=get_headers(),
+            f"{ULTRA_URL}/messages/chat",
+            data={
+                "token": ULTRA_TOKEN,
+                "to": phone,
+                "body": message
+            },
             timeout=10
         )
-        print(f"📤 Sent to {phone}: {resp.status_code}")
+        print(f"📤 Sent to {phone}: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"❌ Send error: {e}")
 
@@ -55,62 +47,16 @@ def send_to_owner(message):
     if OWNER_NUMBER:
         send_message(OWNER_NUMBER, message)
 
-# ── POLL WHAPI FOR NEW MESSAGES EVERY SECOND ──────────────────
-def poll_messages():
-    print("🔄 Message polling started — checking every second...")
-    while True:
-        try:
-            resp = requests.get(
-                f"{WHAPI_BASE}/messages/list/incoming",
-                headers=get_headers(),
-                params={"count": 20},
-                timeout=10
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                messages = data.get("messages", [])
-                for msg in messages:
-                    msg_id = msg.get("id", "")
-                    # Skip already processed messages
-                    if msg_id in processed_ids:
-                        continue
-                    processed_ids.add(msg_id)
-                    # Skip our own messages
-                    if msg.get("from_me"):
-                        continue
-                    sender  = msg.get("chat_id", "")
-                    message = msg.get("text", {}).get("body", "")
-                    if not message or not sender:
-                        continue
-                    print(f"📩 New message from {sender}: {message}")
-                    process_message(sender, message)
-            else:
-                print(f"⚠️ Poll error: {resp.status_code}")
-        except Exception as e:
-            print(f"❌ Poll error: {e}")
-        time.sleep(1)  # Check every second
-
-# ── KEEP ALIVE — Ping every 5 minutes ─────────────────────────
+# ── KEEP ALIVE ────────────────────────────────────────────────
 def keep_alive():
     print("💓 Keep-alive started...")
     while True:
         time.sleep(300)
         try:
             requests.get(f"{RENDER_URL}/ping", timeout=10)
-            print("✅ Keep-alive ping sent")
+            print("✅ Keep-alive ping")
         except Exception as e:
             print(f"⚠️ Keep-alive error: {e}")
-
-# ── PROCESS MESSAGE ───────────────────────────────────────────
-def process_message(sender, message):
-    if is_owner(sender):
-        handle_owner(message)
-    else:
-        try:
-            reply = get_ai_reply(sender, message)
-            send_message(sender, reply)
-        except Exception as e:
-            print(f"❌ Reply error: {e}")
 
 # ── AI REPLY ──────────────────────────────────────────────────
 def get_ai_reply(sender, message):
@@ -170,7 +116,7 @@ def handle_owner(message):
             f"✅ Bot is running!\n"
             f"💬 Active chats: {len(active_chats)}\n"
             f"📝 Conversations: {len(conversations)}\n"
-            f"📨 Processed messages: {len(processed_ids)}"
+            f"📨 Processed: {len(processed_ids)}"
         )
         return
     if msg.lower() == "/list":
@@ -198,7 +144,7 @@ def handle_owner(message):
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=100,
-            system="Generate a short friendly WhatsApp opening message to reconnect with someone. Just the message only.",
+            system="Generate a short friendly WhatsApp opening message. Just the message only.",
             messages=[{"role": "user", "content": "Start"}]
         )
         opener = response.content[0].text
@@ -209,27 +155,37 @@ def handle_owner(message):
         send_message(phone, opener)
         send_to_owner(f"✅ Started chat with +{phone}\nMessage: \"{opener}\"")
 
-# ── ROUTES ────────────────────────────────────────────────────
+# ── WEBHOOK ───────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receives messages from Whapi webhook"""
     data = request.get_json(silent=True)
     if not data:
-        return jsonify({"status": "ok"})
+        data = request.form.to_dict()
+    print(f"📩 Webhook: {data}")
     try:
-        for msg in data.get("messages", []):
-            msg_id = msg.get("id", "")
-            if msg_id in processed_ids:
-                continue
-            processed_ids.add(msg_id)
-            if msg.get("from_me"):
-                continue
-            sender  = msg.get("chat_id", "")
-            message = msg.get("text", {}).get("body", "")
-            print(f"📩 Webhook message from {sender}: {message}")
-            if not message or not sender:
-                continue
-            process_message(sender, message)
+        # UltraMsg format
+        sender  = data.get("sender", data.get("from", ""))
+        message = data.get("body", data.get("message", ""))
+        msg_id  = data.get("id", sender + message)
+
+        if not message or not sender:
+            return jsonify({"status": "ok"})
+        if msg_id in processed_ids:
+            return jsonify({"status": "ok"})
+        processed_ids.add(msg_id)
+
+        # Skip status messages
+        if data.get("type") not in ["chat", None, ""]:
+            return jsonify({"status": "ok"})
+
+        print(f"Message from {sender}: {message}")
+
+        if is_owner(sender):
+            handle_owner(message)
+        else:
+            reply = get_ai_reply(sender, message)
+            send_message(sender, reply)
+
     except Exception as e:
         print(f"❌ Webhook error: {e}")
     return jsonify({"status": "ok"})
@@ -239,22 +195,15 @@ def home():
     return jsonify({
         "status": "✅ Bot is running!",
         "active_chats": len(active_chats),
-        "conversations": len(conversations),
-        "processed_messages": len(processed_ids)
+        "conversations": len(conversations)
     })
 
 @app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "alive!"})
 
-# ── START BACKGROUND THREADS ──────────────────────────────────
-poll_thread = threading.Thread(target=poll_messages)
-poll_thread.daemon = True
-poll_thread.start()
-
-alive_thread = threading.Thread(target=keep_alive)
-alive_thread.daemon = True
-alive_thread.start()
+# ── START THREADS ─────────────────────────────────────────────
+threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(
@@ -262,3 +211,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
+
